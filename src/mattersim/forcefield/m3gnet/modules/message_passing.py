@@ -1,26 +1,29 @@
-# -*- coding: utf-8 -*-
+"""
+This module implements the message passing components for the M3GNet model.
+
+It includes classes for three-body interactions, atom and edge updates,
+and the main message passing block.
+"""
+
 import torch
 import torch.nn as nn
-from torch_runstats.scatter import scatter
 
 from .layers import GatedMLP, LinearLayer, SigmoidLayer, SwishLayer
+from .scatter import scatter_sum
 
 
 def polynomial(r: torch.Tensor, cutoff: float) -> torch.Tensor:
     """
-    Polynomial cutoff function
+    Polynomial cutoff helper function.
+
     Args:
         r (tf.Tensor): radius distance tensor
         cutoff (float): cutoff distance
-    Returns: polynomial cutoff functions
+    Returns:
+        polynomial cutoff functions
     """
     ratio = torch.div(r, cutoff)
-    result = (
-        1
-        - 6 * torch.pow(ratio, 5)
-        + 15 * torch.pow(ratio, 4)
-        - 10 * torch.pow(ratio, 3)
-    )
+    result = 1 - 6 * torch.pow(ratio, 5) + 15 * torch.pow(ratio, 4) - 10 * torch.pow(ratio, 3)
     return torch.clamp(result, min=0.0)
 
 
@@ -35,17 +38,12 @@ class ThreeDInteraction(nn.Module):
         threebody_cutoff,
     ):
         super().__init__()
-        # self.sbf = SphericalBesselFunction(
-        #            max_l=max_l, max_n=max_n, cutoff=cutoff, smooth=smooth)
-        # self.shf = SphericalHarmonicsFunction(max_l=max_l, use_phi=use_phi)
         self.atom_mlp = SigmoidLayer(in_dim=units, out_dim=spherecal_dim)
-        # Linyu have modified the self.edge_gate_mlp
-        # by adding swish activation and use_bias=False
         self.edge_gate_mlp = GatedMLP(
             in_dim=spherecal_dim,
             out_dims=[units],
             activation="swish",
-            use_bias=False,  # noqa: E501
+            use_bias=False,
         )
         self.cutoff = cutoff
         self.threebody_cutoff = threebody_cutoff
@@ -63,27 +61,13 @@ class ThreeDInteraction(nn.Module):
     ):
         atom_mask = (
             self.atom_mlp(atom_attr)[edge_index[0][three_body_index[:, 1]]]
-            * polynomial(
-                edge_length[three_body_index[:, 0]], self.threebody_cutoff  # noqa: E501
-            )
-            * polynomial(
-                edge_length[three_body_index[:, 1]], self.threebody_cutoff  # noqa: E501
-            )
+            * polynomial(edge_length[three_body_index[:, 0]], self.threebody_cutoff)
+            * polynomial(edge_length[three_body_index[:, 1]], self.threebody_cutoff)
         )
         three_basis = three_basis * atom_mask
-        index_map = torch.arange(torch.sum(num_edges).item()).to(
-            edge_length.device
-        )  # noqa: E501
-        index_map = torch.repeat_interleave(index_map, num_triple_ij).to(
-            edge_length.device
-        )
-        e_ij_tuda = scatter(
-            three_basis,
-            index_map,
-            dim=0,
-            reduce="sum",
-            dim_size=torch.sum(num_edges).item(),
-        )
+        num_edges_total = edge_attr.shape[0]
+        index_map = three_body_index[:, 0]
+        e_ij_tuda = scatter_sum(three_basis, index_map, dim=0, dim_size=num_edges_total)
         edge_attr_prime = edge_attr + self.edge_gate_mlp(e_ij_tuda)
         return edge_attr_prime
 
@@ -104,9 +88,7 @@ class AtomLayer(nn.Module):
             in_dim=2 * atom_attr_dim + spherecal_dim,
             out_dims=[128, 64, atom_attr_dim],  # noqa: E501
         )  # [2*atom_attr_dim+edge_attr_prime_dim]  ->  [atom_attr_dim]
-        self.edge_layer = LinearLayer(
-            in_dim=edge_attr_dim, out_dim=1
-        )  # [atom_attr_dim]  ->  [1]
+        self.edge_layer = LinearLayer(in_dim=edge_attr_dim, out_dim=1)  # [atom_attr_dim]  ->  [1]
 
     def forward(
         self,
@@ -125,11 +107,8 @@ class AtomLayer(nn.Module):
             dim=1,
         )
         atom_attr_prime = self.gated_mlp(feat) * self.edge_layer(edge_attr)
-        atom_attr_prime = scatter(
-            atom_attr_prime,
-            edge_index[1],
-            dim=0,
-            dim_size=torch.sum(num_atoms).item(),  # noqa: E501
+        atom_attr_prime = scatter_sum(
+            atom_attr_prime, edge_index[1], dim=0, dim_size=atom_attr.shape[0]
         )
         return atom_attr_prime + atom_attr
 
@@ -234,9 +213,7 @@ class MainBlock(nn.Module):
             [atom_attr[edge_index[0]], atom_attr[edge_index[1]], edge_attr],
             dim=1,  # noqa: E501
         )
-        edge_attr = edge_attr + self.gated_mlp_edge(
-            feat
-        ) * self.edge_layer_edge(  # noqa: E501
+        edge_attr = edge_attr + self.gated_mlp_edge(feat) * self.edge_layer_edge(  # noqa: E501
             edge_attr_zero
         )
 
@@ -245,14 +222,9 @@ class MainBlock(nn.Module):
             [atom_attr[edge_index[0]], atom_attr[edge_index[1]], edge_attr],
             dim=1,  # noqa: E501
         )
-        atom_attr_prime = self.gated_mlp_atom(feat) * self.edge_layer_atom(
-            edge_attr_zero
-        )
-        atom_attr = atom_attr + scatter(  # noqa: E501
-            atom_attr_prime,
-            edge_index[0],
-            dim=0,
-            dim_size=torch.sum(num_atoms).item(),  # noqa: E501
+        atom_attr_prime = self.gated_mlp_atom(feat) * self.edge_layer_atom(edge_attr_zero)
+        atom_attr = atom_attr + scatter_sum(
+            atom_attr_prime, edge_index[0], dim=0, dim_size=atom_attr.shape[0]
         )
 
         return atom_attr, edge_attr

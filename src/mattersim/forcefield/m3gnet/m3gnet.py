@@ -1,12 +1,10 @@
-# -*- coding: utf-8 -*-
+from functools import partial
 from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_runstats.scatter import scatter
-
-from mattersim.jit_compile_tools.jit import compile_mode
+from torch.utils.checkpoint import checkpoint
 
 from .modules import (  # noqa: F501
     MLP,
@@ -15,10 +13,10 @@ from .modules import (  # noqa: F501
     SmoothBesselBasis,
     SphericalBasisLayer,
 )
+from .modules.scatter import scatter_sum
 from .scaling import AtomScaling
 
 
-@compile_mode("script")
 class M3Gnet(nn.Module):
     """
     M3Gnet
@@ -34,6 +32,7 @@ class M3Gnet(nn.Module):
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         max_z: int = 94,
         threebody_cutoff: float = 4.0,
+        gradient_checkpointing: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -57,9 +56,10 @@ class M3Gnet(nn.Module):
             in_dim=max_z + 1, out_dims=[units], activation=None, use_bias=False
         )
         self.atom_embedding.apply(self.init_weights_uniform)
-        self.normalizer = AtomScaling(verbose=False, max_z=max_z)
+        self.normalizer = AtomScaling(verbose=False, max_z=max_z, device=device)
         self.max_z = max_z
         self.device = device
+        self.gradient_checkpointing = gradient_checkpointing
         self.model_args = {
             "num_blocks": num_blocks,
             "units": units,
@@ -68,6 +68,7 @@ class M3Gnet(nn.Module):
             "cutoff": cutoff,
             "max_z": max_z,
             "threebody_cutoff": threebody_cutoff,
+            "gradient_checkpointing": gradient_checkpointing,
         }
 
     def forward(
@@ -78,29 +79,19 @@ class M3Gnet(nn.Module):
         # Exact data from input_dictionary
         pos = input["atom_pos"]
         cell = input["cell"]
-        pbc_offsets = input["pbc_offsets"].float()
+        pbc_offsets = input["pbc_offsets"].to(pos.dtype)
         atom_attr = input["atom_attr"]
         edge_index = input["edge_index"].long()
         three_body_indices = input["three_body_indices"].long()
-        num_three_body = input["num_three_body"]
         num_bonds = input["num_bonds"]
         num_triple_ij = input["num_triple_ij"]
         num_atoms = input["num_atoms"]
-        num_graphs = input["num_graphs"]
         batch = input["batch"]
-
-        # -------------------------------------------------------------#
-        cumsum = torch.cumsum(num_bonds, dim=0) - num_bonds
-        index_bias = torch.repeat_interleave(  # noqa: F501
-            cumsum, num_three_body, dim=0
-        ).unsqueeze(-1)
-        three_body_indices = three_body_indices + index_bias
 
         # === Refer to the implementation of M3GNet,        ===
         # === we should re-compute the following attributes ===
         # edge_length, edge_vector(optional), triple_edge_length, theta_jik
-        atoms_batch = torch.repeat_interleave(repeats=num_atoms)
-        edge_batch = atoms_batch[edge_index[0]]
+        edge_batch = batch[edge_index[0]]
         edge_vector = pos[edge_index[0]] - (
             pos[edge_index[1]]
             + torch.einsum("bi, bij->bj", pbc_offsets, cell[edge_batch])
@@ -124,26 +115,48 @@ class M3Gnet(nn.Module):
         edge_attr = self.edge_encoder(edge_attr)
         three_basis = self.sbf(triple_edge_length, torch.acos(cos_jik))
 
-        # Main Loop
+        # Main Loop - use gradient checkpointing if enabled to reduce memory
+        # Note: checkpointing works in both training and eval mode
+        # (for MD force computation)
         for idx, conv in enumerate(self.graph_conv):
-            atom_attr, edge_attr = conv(
-                atom_attr,
-                edge_attr,
-                edge_attr_zero,
-                edge_index,
-                three_basis,
-                three_body_indices,
-                edge_length,
-                num_bonds,
-                num_triple_ij,
-                num_atoms,
+            func = partial(
+                conv,
+                atom_attr=atom_attr,
+                edge_attr=edge_attr,
+                edge_attr_zero=edge_attr_zero,
+                edge_index=edge_index,
+                three_basis=three_basis,
+                three_body_index=three_body_indices,
+                edge_length=edge_length,
+                num_edges=num_bonds,
+                num_triple_ij=num_triple_ij,
+                num_atoms=num_atoms,
             )
+            if self.gradient_checkpointing:
+                # use_reentrant=False is recommended and works with
+                # native scatter operations
+                atom_attr, edge_attr = checkpoint(
+                    func,
+                    use_reentrant=False,
+                )
+            else:
+                atom_attr, edge_attr = func()
 
         energies_i = self.final(atom_attr).view(-1)  # [batch_size*num_atoms]
         energies_i = self.normalizer(energies_i, atomic_numbers)
-        energies = scatter(energies_i, batch, dim=0, dim_size=num_graphs)
+        energies = scatter_sum(energies_i, batch, dim=0, dim_size=cell.shape[0])
 
         return energies  # [batch_size]
+
+    def enable_gradient_checkpointing(self, enable: bool = True):
+        """Enable or disable gradient checkpointing for memory-efficient
+        training/inference.
+
+        When enabled, intermediate activations are recomputed during backward
+        pass instead of being stored, significantly reducing memory usage at
+        the cost of up to 30% slower computation.
+        """
+        self.gradient_checkpointing = enable
 
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -155,15 +168,8 @@ class M3Gnet(nn.Module):
 
     @torch.jit.export
     def one_hot_atoms(self, species):
-        # one_hots = []
-        # for i in range(species.shape[0]):
-        #     one_hots.append(
-        #         F.one_hot(
-        #             species[i],
-        #             num_classes=self.max_z+1).float().to(species.device)
-        #     )
-        # return torch.cat(one_hots, dim=0)
-        return F.one_hot(species, num_classes=self.max_z + 1).float()
+        dtype = self.atom_embedding.mlp[0].linear.weight.dtype
+        return F.one_hot(species, num_classes=self.max_z + 1).to(dtype)
 
     def print(self):
         from prettytable import PrettyTable
